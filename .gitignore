@@ -1,0 +1,6 @@
+org-setup/
+playwright-test/
+.DS_Store
+.idea/
+original-user-files/
+user-files/public_key.pem
