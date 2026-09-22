@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Log Flood Fill 70G (ephemeral-storage crash test)">
+      <stringProp name="TestPlan.comments">Long-running sibling of Log-Flood-Repro.jmx. Floods jmeter.log with the same NTBOneHun-style cookie logging shape (3x "*******" + Before/After lines) but with larger lines and a long scheduler window so it keeps writing until it fills the pod's ephemeral storage (~70 GB) and the kubelet evicts the pod. Run this against the OLD (unbounded &lt;File&gt;) log4j2 image to reproduce the eviction, then against the FIXED (RollingFile) image to confirm the file plateaus (~100-150 MB) and the pod survives the full run. No login / no HTTP endpoint required. NOTE: only crashes on a small-disk node (e.g. prod1 ~80 GiB EBS); a 1000 GiB node would need ~990 GB and will not evict.</stringProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="User Defined Variables">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="USERS" elementType="Argument">
+            <stringProp name="Argument.name">USERS</stringProp>
+            <stringProp name="Argument.value">${__P(users,8)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="RAMP_UP_TIME_IN_S" elementType="Argument">
+            <stringProp name="Argument.name">RAMP_UP_TIME_IN_S</stringProp>
+            <stringProp name="Argument.value">${__P(ramp_up_time_in_s,5)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="DURATION_IN_S" elementType="Argument">
+            <stringProp name="Argument.name">DURATION_IN_S</stringProp>
+            <stringProp name="Argument.value">${__P(duration_in_s,21600)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="LINES_PER_ITERATION" elementType="Argument">
+            <stringProp name="Argument.name">LINES_PER_ITERATION</stringProp>
+            <stringProp name="Argument.value">${__P(lines_per_iteration,10000)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="LINE_PADDING" elementType="Argument">
+            <stringProp name="Argument.name">LINE_PADDING</stringProp>
+            <stringProp name="Argument.value">${__P(line_padding,1000)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="TARGET_BYTES" elementType="Argument">
+            <stringProp name="Argument.name">TARGET_BYTES</stringProp>
+            <stringProp name="Argument.value">${__P(target_bytes,75161927680)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+    </TestPlan>
+    <hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Log Flood Workload (long)" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">${USERS}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${RAMP_UP_TIME_IN_S}</stringProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.duration">${DURATION_IN_S}</stringProp>
+        <stringProp name="ThreadGroup.delay">0</stringProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="Loop Controller">
+          <boolProp name="LoopController.continue_forever">true</boolProp>
+          <stringProp name="LoopController.loops">-1</stringProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="Flood jmeter.log until disk fills" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">// Long-run flood: same NTBOneHun cookie-logging shape as Log-Flood-Repro.jmx
+// (per cookie -&gt; 3x "*******" + "Before Deleting" + "After Deleted"), but with
+// bigger lines and a long scheduler window so jmeter.log keeps growing until the
+// pod's ephemeral storage fills and the kubelet evicts the pod.
+//
+// A shared byte counter tracks approximate jmeter.log growth and logs a heartbeat
+// roughly every ~1 GB so you can watch progress toward the ~70 GB crash point.
+// The counter also stops the flood if TARGET_BYTES is reached without an eviction
+// (e.g. on a large-disk node) so the test cannot loop forever.
+
+int lines = Integer.parseInt(vars.get('LINES_PER_ITERATION'));
+int pad = Integer.parseInt(vars.get('LINE_PADDING'));
+long targetBytes = Long.parseLong(vars.get('TARGET_BYTES'));
+String filler = 'X' * pad;
+int tn = ctx.getThreadNum();
+
+// Shared across all threads via JMeter properties (survives per-sample scope).
+def propsObj = props;
+synchronized (propsObj) {
+    if (propsObj.get('flood.bytes') == null) {
+        propsObj.put('flood.bytes', new java.util.concurrent.atomic.AtomicLong(0L));
+        propsObj.put('flood.nextHeartbeatGb', new java.util.concurrent.atomic.AtomicLong(1L));
+    }
+}
+java.util.concurrent.atomic.AtomicLong written = propsObj.get('flood.bytes');
+java.util.concurrent.atomic.AtomicLong nextGb = propsObj.get('flood.nextHeartbeatGb');
+
+// ~ bytes each formatted jmeter.log line costs (46-byte prefix + msg + newline).
+long shortLine = 55L;
+long padLine = 47L + 40L + (long) pad;
+
+for (int i = 0; i &lt; lines; i++) {
+    log.info('*******');
+    log.info('*******');
+    log.info('*******');
+    log.info('Before Deleting cookie[' + i + '] thread=' + tn + ' ' + filler);
+    log.info('After Deleted cookie[' + i + '] thread=' + tn + ' ' + filler);
+
+    long total = written.addAndGet(3L * shortLine + 2L * padLine);
+
+    // Heartbeat roughly every 1 GB.
+    long gb = total / 1073741824L;
+    if (gb >= nextGb.get()) {
+        nextGb.set(gb + 1L);
+        log.info('=== FLOOD HEARTBEAT: ~' + gb + ' GB written to jmeter.log (target ~'
+            + (targetBytes / 1073741824L) + ' GB) ===');
+    }
+
+    if (total >= targetBytes) {
+        log.info('=== FLOOD TARGET REACHED: ~' + (total / 1073741824L)
+            + ' GB written without eviction; stopping flood loop ===');
+        SampleResult.setResponseMessage('target reached: ' + total + ' bytes');
+        SampleResult.setResponseCodeOK();
+        SampleResult.setSuccessful(true);
+        ctx.getThread().stop();
+        return;
+    }
+}
+
+SampleResult.setResponseMessage('flooded ' + (lines * 5) + ' lines; approx total '
+    + written.get() + ' bytes');
+SampleResult.setResponseCodeOK();
+SampleResult.setSuccessful(true);</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>
